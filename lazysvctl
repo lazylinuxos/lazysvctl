@@ -1,0 +1,877 @@
+#!/bin/sh
+# lazysvctl - A wrapper for runit/sv service management
+# Supports both system-level and per-user services
+
+VERSION="1.0.0"
+SYSTEM_SV_DIR="/var/service"
+SYSTEM_SERVICES_DIR="/etc/sv"
+USER_SV_DIR="${SVDIR:-$HOME/service}"
+DEFAULT_TIMEOUT=7
+
+if [ -t 1 ]; then
+    C_RESET='\033[0m'
+    C_BOLD='\033[1m'
+    C_DIM='\033[2m'
+    C_GREEN='\033[32m'
+    C_RED='\033[31m'
+    C_YELLOW='\033[33m'
+    C_BLUE='\033[34m'
+    C_CYAN='\033[36m'
+else
+    C_RESET=''; C_BOLD=''; C_DIM=''; C_GREEN=''; C_RED=''
+    C_YELLOW=''; C_BLUE=''; C_CYAN=''
+fi
+
+_bold()   { printf "${C_BOLD}%s${C_RESET}" "$*"; }
+_green()  { printf "${C_GREEN}%s${C_RESET}" "$*"; }
+_red()    { printf "${C_RED}%s${C_RESET}" "$*"; }
+_yellow() { printf "${C_YELLOW}%s${C_RESET}" "$*"; }
+_cyan()   { printf "${C_CYAN}%s${C_RESET}" "$*"; }
+_dim()    { printf "${C_DIM}%s${C_RESET}" "$*"; }
+
+_info()    { printf "  $(_cyan '→') %s\n" "$*"; }
+_ok()      { printf "  $(_green '✓') %s\n" "$*"; }
+_warn()    { printf "  $(_yellow '⚠') %s\n" "$*" >&2; }
+_err()     { printf "  $(_red '✗') %s\n" "$*" >&2; }
+_section() { printf "\n${C_BOLD}${C_BLUE}%s${C_RESET}\n" "$*"; }
+
+OPT_USER=0
+OPT_SYSTEM=0
+OPT_QUIET=0
+OPT_TIMEOUT=$DEFAULT_TIMEOUT
+
+usage() {
+    cat <<EOF
+$(_bold "lazysvctl") $(_dim "v${VERSION}") — runit service manager
+
+$(_bold "USAGE")
+  lazysvctl [--user] [-q] [-w SEC] COMMAND [SERVICE...]
+
+$(_bold "GLOBAL OPTIONS")
+  --user          Operate on user services  (SVDIR=$USER_SV_DIR)
+  -q, --quiet     Suppress informational output
+  -w SEC          Override default timeout of ${DEFAULT_TIMEOUT}s
+  -h, --help      Show this help
+  -v, --version   Show version
+
+$(_bold "SERVICE COMMANDS")
+  start    SERVICE...   Start service(s) and keep them running
+  stop     SERVICE...   Stop service(s)
+  restart  SERVICE...   Restart service(s)
+  reload   SERVICE...   Send HUP to service(s) (reload config)
+  status   SERVICE...   Show status and recent log of service(s)
+  enable   SERVICE...   Enable service (symlink for system; restore from .disabled for user)
+  disable  SERVICE...   Disable service (remove symlink for system; move to .disabled for user)
+  once     SERVICE...   Start service once; do not restart on exit
+  kill     SERVICE...   Send KILL signal to service(s)
+  pause    SERVICE...   Send STOP signal to service(s)
+  cont     SERVICE...   Send CONT signal to service(s)
+
+$(_bold "LOGGING COMMANDS")
+  log-tail SERVICE      Follow live log for a service
+  log-cat  SERVICE      Dump entire current log
+
+$(_bold "SYSTEM COMMANDS")
+  list                  List active services
+             [--all]      All services (enabled + disabled)
+             [--disabled] Only disabled (available but not enabled)
+  is-active  SERVICE    Exit 0 if service is running, 1 otherwise
+  is-enabled SERVICE    Exit 0 if service symlink exists, 1 otherwise
+  init                  (--user only) Set up per-user runsvdir service
+
+$(_bold "EXAMPLES")
+  lazysvctl status
+  lazysvctl start sshd nginx
+  lazysvctl --user status
+  lazysvctl --user enable my-tunnel
+  lazysvctl log-tail nginx
+  lazysvctl -w 15 restart postgresql
+
+$(_bold "ENVIRONMENT")
+  SVDIR        Override user service directory (default: ~/service)
+  SVWAIT       Override default timeout (default: ${DEFAULT_TIMEOUT}s)
+EOF
+}
+
+get_svdir() {
+    if [ "$OPT_USER" -eq 1 ]; then
+        [ -d "$USER_SV_DIR" ] || mkdir -p "$USER_SV_DIR"
+        echo "$USER_SV_DIR"
+    else
+        echo "$SYSTEM_SV_DIR"
+    fi
+}
+
+get_services_dir() {
+    if [ "$OPT_USER" -eq 1 ]; then
+        [ -d "$USER_SV_DIR" ] || mkdir -p "$USER_SV_DIR"
+        echo "$USER_SV_DIR"
+    else
+        echo "$SYSTEM_SERVICES_DIR"
+    fi
+}
+
+resolve_service() {
+    svc="$1"
+    case "$svc" in
+        /*|./*|../*) echo "$svc"; return ;;
+    esac
+    echo "$(get_svdir)/${svc}"
+}
+
+_HUMAN_TIME=""
+humanize_seconds() {
+    secs="${1%s}"
+    case "$secs" in
+        ''|*[!0-9]*) _HUMAN_TIME="$secs"; return ;;
+    esac
+    if   [ "$secs" -lt 60 ];    then _HUMAN_TIME="${secs}s"
+    elif [ "$secs" -lt 3600 ];  then _HUMAN_TIME="$((secs / 60))m"
+    elif [ "$secs" -lt 86400 ]; then _HUMAN_TIME="$((secs / 3600))h"
+    else                              _HUMAN_TIME="$((secs / 86400))d"
+    fi
+}
+
+_PID_CMD=""
+pid_command() {
+    pid="$1"
+    if [ -z "$pid" ] || [ "$pid" = "-" ]; then _PID_CMD="-"; return; fi
+
+    if [ -r "/proc/${pid}/comm" ]; then
+        read -r _PID_CMD 2>/dev/null < "/proc/${pid}/comm" || _PID_CMD="-"
+        return
+    fi
+
+    if [ -r "/proc/${pid}/cmdline" ]; then
+        _PID_CMD="$(tr '\0' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | head -1)"
+        _PID_CMD="${_PID_CMD##*/}"
+        _PID_CMD="${_PID_CMD#-}"
+        if [ "${#_PID_CMD}" -gt 15 ]; then
+            _PID_CMD="${_PID_CMD%"${_PID_CMD#???????????????}"}"
+        fi
+        [ -n "$_PID_CMD" ] && return
+    fi
+
+    _PID_CMD="$(ps -p "$pid" -o comm= 2>/dev/null)" || _PID_CMD="-"
+    [ -z "$_PID_CMD" ] && _PID_CMD="-"
+}
+
+parse_sv_status() {
+    raw="$1"
+    _STATE="unknown"
+    _PID=""
+    _UPTIME_RAW=""
+    _WANT=""
+    _PAUSED=""
+    _PERMISSION_DENIED=0
+    _LOG_STATE=""
+
+    case "$raw" in
+        *"permission denied"*|*"Permission denied"*)
+            _PERMISSION_DENIED=1
+            return
+            ;;
+        run:*)
+            _STATE="run"
+            _PID=$(printf '%s' "$raw" | grep -oE '\(pid [0-9]+\)' | grep -oE '[0-9]+' | head -1)
+            _UPTIME_RAW=$(printf '%s' "$raw" | grep -oE '[0-9]+s' | head -1)
+            case "$raw" in *"normally down"*) _WANT="down" ;; esac
+            case "$raw" in *"paused"*)        _PAUSED="paused" ;; esac
+            ;;
+        down:*)
+            _UPTIME_RAW=$(printf '%s' "$raw" | grep -oE '[0-9]+s' | head -1)
+            case "$raw" in *"paused"*) _PAUSED="paused" ;; esac
+            case "$raw" in
+                *"want up"*) _STATE="failed"; _WANT="up" ;;
+                *)           _STATE="down" ;;
+            esac
+            ;;
+        *"supervise not running"*)
+            _STATE="unsupervised"
+            ;;
+    esac
+
+    case "$raw" in
+        *"; run: log:"*)  _LOG_STATE="run" ;;
+        *"; down: log:"*) _LOG_STATE="down" ;;
+    esac
+}
+
+find_log_file() {
+    svc_name="$1"
+    svc_path="$2"
+    for candidate in \
+        "${svc_path}/log/main/current" \
+        "${svc_path}/log/current" \
+        "/var/log/${svc_name}/current" \
+        "/var/log/${svc_name}/${svc_name}.log" \
+        "/var/log/${svc_name}.log"; do
+        [ -f "$candidate" ] && echo "$candidate" && return 0
+    done
+    return 1
+}
+
+cmd_status() {
+    svdir="$(get_svdir)"
+
+    _status_one() {
+        svc_path="$1"
+        svc_name="$(basename "$svc_path")"
+        raw="$(SVDIR="$svdir" sv status "$svc_path" 2>&1)"
+        parse_sv_status "$raw"
+
+        if [ "$_PERMISSION_DENIED" -eq 1 ]; then
+            state_str="$(_yellow '! permission denied')"
+        else
+            case "$_STATE" in
+                run)          state_str="$(_green '● active (running)')" ;;
+                down)         state_str="$(_red   '○ inactive (dead)')" ;;
+                unsupervised) state_str="$(_yellow '? not supervised')" ;;
+                *)            state_str="$(_dim    '? unknown')" ;;
+            esac
+        fi
+
+        printf "  %s  $(_bold '%s')\n" "$state_str" "$svc_name"
+
+        if [ "$_PERMISSION_DENIED" -eq 1 ]; then
+            printf "     $(_dim 'Note:   ') %s\n" "run as root to see full status"
+            printf "     $(_dim 'Path:   ') %s\n" "$svc_path"
+            return
+        fi
+
+        if [ -n "$_PID" ]; then
+            pid_command "$_PID"
+            printf "     $(_dim 'PID:    ') %s  $(_dim '(%s)')\n" "$_PID" "$_PID_CMD"
+        fi
+
+        if [ -n "$_UPTIME_RAW" ]; then
+            humanize_seconds "$_UPTIME_RAW"
+            printf "     $(_dim 'Uptime: ') %s\n" "$_HUMAN_TIME"
+        fi
+
+        [ -n "$_WANT"   ] && printf "     $(_dim 'Want:   ') %s\n" "$_WANT"
+        [ -n "$_PAUSED" ] && printf "     $(_dim 'Note:   ') %s\n" "$(_yellow 'paused')"
+
+        printf "     $(_dim 'Path:   ') %s\n" "$svc_path"
+
+        if [ -n "$_LOG_STATE" ]; then
+            case "$_LOG_STATE" in
+                run)  ls_str="$(_green 'running')" ;;
+                down) ls_str="$(_red 'down')" ;;
+                *)    ls_str="$(_dim 'unknown')" ;;
+            esac
+            printf "     $(_dim 'Log:    ') %s\n" "$ls_str"
+        elif [ -d "${svc_path}/log" ]; then
+            log_raw="$(SVDIR="$svdir" sv status "${svc_path}/log" 2>&1)"
+            case "$log_raw" in
+                run:*)  ls_str="$(_green 'running')" ;;
+                down:*) ls_str="$(_red 'down')" ;;
+                *)      ls_str="$(_dim 'unknown')" ;;
+            esac
+            printf "     $(_dim 'Log:    ') %s\n" "$ls_str"
+        fi
+    }
+
+    if [ $# -eq 0 ]; then
+        _err "Usage: lazysvctl status SERVICE..."
+        _info "Use 'lazysvctl list' to see all services."
+        return 1
+    fi
+
+    for svc in "$@"; do
+        svc_path="$(resolve_service "$svc")"
+        svc_name="$(basename "$svc_path")"
+        _section "Service: $svc"
+        if [ ! -d "$svc_path" ]; then
+            _err "Not found: $svc_path"
+            echo
+            continue
+        fi
+        _status_one "$svc_path"
+
+        _resolve_log "$svc_name"
+        if [ $? -eq 0 ]; then
+            printf "
+     $(_dim 'Recent log:')
+"
+            if [ "$_LOG_IS_SOCKLOG" -eq 1 ]; then
+                grep "$svc_name" "$_RESOLVED_LOG" | tail -n 10 | while IFS= read -r line; do
+                    printf "     $(_dim '%s')
+" "$line"
+                done
+            else
+                tail -n 10 "$_RESOLVED_LOG" | while IFS= read -r line; do
+                    printf "     $(_dim '%s')
+" "$line"
+                done
+            fi
+        fi
+        echo
+    done
+}
+
+_pad() {
+    plain="$1"; colored="$2"; width="$3"
+    printf '%s' "$colored"
+    pad=$((width - ${#plain}))
+    [ "$pad" -gt 0 ] && printf "%${pad}s" ""
+}
+
+_dashes() {
+    n=$1; i=0
+    while [ "$i" -lt "$n" ]; do printf '─'; i=$((i+1)); done
+}
+
+_print_table_row() {
+    _r="$1"
+    _svc="${_r%%"$SEP"*}";   _r="${_r#*"$SEP"}"
+    _st_p="${_r%%"$SEP"*}";  _r="${_r#*"$SEP"}"
+    _st_c="${_r%%"$SEP"*}";  _r="${_r#*"$SEP"}"
+    _en_p="${_r%%"$SEP"*}";  _r="${_r#*"$SEP"}"
+    _en_c="${_r%%"$SEP"*}";  _r="${_r#*"$SEP"}"
+    _pid_p="${_r%%"$SEP"*}"; _r="${_r#*"$SEP"}"
+    _pid_c="${_r%%"$SEP"*}"; _r="${_r#*"$SEP"}"
+    _cmd_p="${_r%%"$SEP"*}"; _r="${_r#*"$SEP"}"
+    _cmd_c="${_r%%"$SEP"*}"; _r="${_r#*"$SEP"}"
+    _tp="${_r%%"$SEP"*}";    _tc="${_r#*"$SEP"}"
+    printf "  "
+    _pad "$_svc"   "$_svc"   $mw_svc;   printf "  "
+    _pad "$_st_p"  "$_st_c"  $mw_state; printf "  "
+    _pad "$_en_p"  "$_en_c"  $mw_ena;   printf "  "
+    _pad "$_pid_p" "$_pid_c" $mw_pid;   printf "  "
+    _pad "$_cmd_p" "$_cmd_c" $mw_cmd;   printf "  "
+    printf "%s\n" "$_tc"
+}
+
+_print_table_header() {
+    printf "\n  "
+    _pad "SERVICE" "SERVICE" $mw_svc;   printf "  "
+    _pad "STATE"   "STATE"   $mw_state; printf "  "
+    _pad "ENABLED" "ENABLED" $mw_ena;   printf "  "
+    _pad "PID"     "PID"     $mw_pid;   printf "  "
+    _pad "COMMAND" "COMMAND" $mw_cmd;   printf "  "
+    printf "TIME\n"
+    printf "  "; _dashes $mw_svc;   printf "  "
+                 _dashes $mw_state; printf "  "
+                 _dashes $mw_ena;   printf "  "
+                 _dashes $mw_pid;   printf "  "
+                 _dashes $mw_cmd;   printf "  "
+    printf "────\n"
+}
+
+_state_fields() {
+    if [ "$_PERMISSION_DENIED" -eq 1 ]; then
+        _st_plain="!denied";       _st_color="$(_yellow '!denied')"
+        _pid_plain="n/a";          _pid_color="$(_dim 'n/a')"
+        _cmd_plain="run as root";  _cmd_color="$(_dim 'run as root')"
+        _time_plain="-";           _time_color="$(_dim '-')"
+        return
+    fi
+    case "$_STATE" in
+        run)
+            _st_plain="  running"; _st_color="$(_green '✔ running')"
+            _pid_plain="${_PID:--}"; _pid_color="$_pid_plain"
+            pid_command "$_PID";   _cmd_plain="$_PID_CMD"; _cmd_color="$_cmd_plain"
+            if [ -n "$_UPTIME_RAW" ]; then
+                humanize_seconds "$_UPTIME_RAW"; _time_plain="$_HUMAN_TIME"
+            else
+                _time_plain="-"
+            fi
+            _time_color="$_time_plain"
+            ;;
+        failed)
+            _st_plain="  failed";  _st_color="$(_red '✘ failed')"
+            _pid_plain="-";        _pid_color="-"
+            _cmd_plain="-";        _cmd_color="-"
+            _time_plain="-";       _time_color="$(_dim '-')"
+            ;;
+        down)
+            _st_plain="down";      _st_color="$(_dim 'down')"
+            _pid_plain="-";        _pid_color="-"
+            _cmd_plain="-";        _cmd_color="-"
+            if [ -n "$_UPTIME_RAW" ]; then
+                humanize_seconds "$_UPTIME_RAW"; _time_plain="$_HUMAN_TIME"
+            else
+                _time_plain="-"
+            fi
+            _time_color="$(_dim "$_time_plain")"
+            ;;
+        unsupervised)
+            _st_plain="n/a";       _st_color="$(_yellow 'n/a')"
+            _pid_plain="-";        _pid_color="-"
+            _cmd_plain="-";        _cmd_color="-"
+            _time_plain="-";       _time_color="-"
+            ;;
+        *)
+            _st_plain="---";       _st_color="$(_dim '---')"
+            _pid_plain="-";        _pid_color="-"
+            _cmd_plain="-";        _cmd_color="-"
+            _time_plain="-";       _time_color="-"
+            ;;
+    esac
+}
+
+cmd_list() {
+    show_all=0
+    show_disabled=0
+    for _arg in "$@"; do
+        case "$_arg" in
+            --all)      show_all=1 ;;
+            --disabled) show_disabled=1 ;;
+        esac
+    done
+
+    svdir="$(get_svdir)"
+    svc_base="$(get_services_dir)"
+
+    if [ ! -d "$svdir" ]; then
+        _err "Service directory not found: $svdir"; return 1
+    fi
+
+    if [ "$show_disabled" -eq 1 ]; then
+        if [ "$OPT_USER" -eq 1 ]; then
+            disabled_dir="$svdir/.disabled"
+            if [ ! -d "$disabled_dir" ] || [ -z "$(ls -A "$disabled_dir" 2>/dev/null)" ]; then
+                _info "No disabled user services found in $disabled_dir"
+                return 0
+            fi
+            _section "Disabled user services"
+            for d in "$disabled_dir"/*/; do
+                [ -d "$d" ] || continue
+                printf "  %s  %s\n" "$(_red '○')" "$(_bold "$(basename "$d")")"
+            done
+            echo
+            return 0
+        fi
+        _list_rows_disabled "$svdir" "$svc_base"
+        return
+    fi
+
+    svc_list=""
+    if [ "$show_all" -eq 1 ] && [ "$OPT_USER" -eq 0 ]; then
+        for d in "$svc_base"/*/; do
+            [ -d "$d" ] || continue
+            svc_list="$svc_list $(basename "$d")"
+        done
+    else
+        for d in "$svdir"/*/; do
+            [ -d "$d" ] || continue
+            svc_list="$svc_list $(basename "$d")"
+        done
+    fi
+
+    _list_rows_active "$svdir" "$svc_list"
+}
+
+_list_rows_active() {
+    svdir="$1"; svc_list="$2"
+    SEP=$(printf '\037')
+
+    mw_svc=7; mw_state=5; mw_ena=7; mw_pid=3; mw_cmd=7; mw_time=4
+
+    rows=""
+    for svc_name in $svc_list; do
+        if [ -e "$svdir/$svc_name" ]; then
+            ena_plain="yes"; ena_color="$(_green 'yes')"
+        else
+            ena_plain="no";  ena_color="$(_dim   'no')"
+        fi
+
+        raw="$(SVDIR="$svdir" sv status "$svdir/$svc_name" 2>&1)"
+        parse_sv_status "$raw"
+        _state_fields
+
+        [ "${#svc_name}"    -gt "$mw_svc"   ] && mw_svc="${#svc_name}"
+        [ "${#_st_plain}"   -gt "$mw_state" ] && mw_state="${#_st_plain}"
+        [ "${#ena_plain}"   -gt "$mw_ena"   ] && mw_ena="${#ena_plain}"
+        [ "${#_pid_plain}"  -gt "$mw_pid"   ] && mw_pid="${#_pid_plain}"
+        [ "${#_cmd_plain}"  -gt "$mw_cmd"   ] && mw_cmd="${#_cmd_plain}"
+        [ "${#_time_plain}" -gt "$mw_time"  ] && mw_time="${#_time_plain}"
+
+        row="${svc_name}${SEP}${_st_plain}${SEP}${_st_color}${SEP}${ena_plain}${SEP}${ena_color}${SEP}${_pid_plain}${SEP}${_pid_color}${SEP}${_cmd_plain}${SEP}${_cmd_color}${SEP}${_time_plain}${SEP}${_time_color}"
+        rows="${rows}${row}
+"
+    done
+
+    _print_table_header
+    printf '%s' "$rows" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        _print_table_row "$line"
+    done
+    echo
+}
+
+_list_rows_disabled() {
+    svdir="$1"; svc_base="$2"
+    SEP=$(printf '\037')
+
+    mw_svc=7; mw_state=5; mw_ena=7; mw_pid=3; mw_cmd=7; mw_time=4
+
+    rows=""; found=0
+    for svc_dir in "$svc_base"/*/; do
+        [ -d "$svc_dir" ] || continue
+        svc_name="$(basename "$svc_dir")"
+        [ -e "$svdir/$svc_name" ] && continue
+        found=1
+        [ "${#svc_name}" -gt "$mw_svc" ] && mw_svc="${#svc_name}"
+        row="${svc_name}${SEP}---${SEP}$(_dim '---')${SEP}no${SEP}$(_dim 'no')${SEP}-${SEP}-${SEP}-${SEP}-${SEP}-${SEP}-"
+        rows="${rows}${row}
+"
+    done
+
+    if [ "$found" -eq 0 ]; then
+        _ok "All available services are enabled"
+        return 0
+    fi
+
+    _print_table_header
+    printf '%s' "$rows" | while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        _print_table_row "$line"
+    done
+    echo
+}
+
+cmd_sv() {
+    action="$1"; shift
+    if [ $# -eq 0 ]; then
+        _err "No service specified. Usage: lazysvctl $action SERVICE..."
+        return 1
+    fi
+    svdir="$(get_svdir)"
+    exit_code=0
+    for svc in "$@"; do
+        svc_path="$(resolve_service "$svc")"
+        svc_name="$(basename "$svc_path")"
+        if [ ! -d "$svc_path" ]; then
+            _err "Service not found: $svc_path"
+            exit_code=1
+            continue
+        fi
+        [ "$OPT_QUIET" -eq 0 ] && _info "${action}: $svc_name"
+        result="$(SVDIR="$svdir" sv -w "$OPT_TIMEOUT" "$action" "$svc_path" 2>&1)"
+        ret=$?
+        if [ $ret -eq 0 ]; then
+            [ "$OPT_QUIET" -eq 0 ] && _ok "$result"
+        else
+            _err "$result"
+            exit_code=1
+        fi
+    done
+    return $exit_code
+}
+
+cmd_enable() {
+    if [ $# -eq 0 ]; then _err "Usage: lazysvctl enable SERVICE..."; return 1; fi
+    svdir="$(get_svdir)"
+    for svc in "$@"; do
+        if [ "$OPT_USER" -eq 1 ]; then
+            target="$svdir/$svc"
+            disabled_dir="$svdir/.disabled"
+            disabled_svc="$disabled_dir/$svc"
+            if [ -d "$disabled_svc" ]; then
+                mv "$disabled_svc" "$target" \
+                    && _ok "Enabled $svc (restored from .disabled)" \
+                    || _err "Failed to restore $svc from $disabled_dir"
+            elif [ -d "$target" ]; then
+                _warn "$svc is already enabled in $svdir"
+            else
+                _err "User service not found: $target"
+                _info "Create $target with a run script to define the service."
+            fi
+        else
+            src="$SYSTEM_SERVICES_DIR/$svc"
+            dst="$SYSTEM_SV_DIR/$svc"
+            if [ ! -d "$src" ]; then
+                _err "Service definition not found: $src"; continue
+            fi
+            if [ -L "$dst" ] || [ -d "$dst" ]; then
+                _warn "$svc is already enabled"; continue
+            fi
+            ln -s "$src" "$dst" && _ok "Enabled $svc" \
+                || _err "Failed to enable $svc (permission denied?)"
+        fi
+    done
+}
+
+cmd_disable() {
+    if [ $# -eq 0 ]; then _err "Usage: lazysvctl disable SERVICE..."; return 1; fi
+    svdir="$(get_svdir)"
+    for svc in "$@"; do
+        if [ "$OPT_USER" -eq 1 ]; then
+            target="$svdir/$svc"
+            disabled_dir="$svdir/.disabled"
+            if [ ! -d "$target" ]; then
+                _warn "User service not found: $target"; continue
+            fi
+            SVDIR="$svdir" sv -w "$OPT_TIMEOUT" down "$target" >/dev/null 2>&1
+            mkdir -p "$disabled_dir"
+            mv "$target" "$disabled_dir/$svc" \
+                && _ok "Disabled $svc (moved to $disabled_dir/$svc)" \
+                || _err "Failed to disable $svc"
+        else
+            dst="$SYSTEM_SV_DIR/$svc"
+            if [ ! -L "$dst" ] && [ ! -d "$dst" ]; then
+                _warn "$svc is not enabled"; continue
+            fi
+            SVDIR="$SYSTEM_SV_DIR" sv -w "$OPT_TIMEOUT" down "$dst" >/dev/null 2>&1
+            rm -f "$dst" && _ok "Disabled $svc" \
+                || _err "Failed to disable $svc (permission denied?)"
+        fi
+    done
+}
+
+cmd_is_active() {
+    [ $# -eq 0 ] && { _err "Usage: lazysvctl is-active SERVICE"; return 1; }
+    svc_path="$(resolve_service "$1")"
+    raw="$(SVDIR="$(get_svdir)" sv status "$svc_path" 2>&1)"
+    case "$raw" in
+        run:*) [ "$OPT_QUIET" -eq 0 ] && printf "%s\n" "$(_green active)"; return 0 ;;
+        *)     [ "$OPT_QUIET" -eq 0 ] && printf "%s\n" "$(_red inactive)"; return 1 ;;
+    esac
+}
+
+cmd_is_enabled() {
+    [ $# -eq 0 ] && { _err "Usage: lazysvctl is-enabled SERVICE"; return 1; }
+    svc="$1"
+    if [ "$OPT_USER" -eq 1 ]; then target="$USER_SV_DIR/$svc"
+    else target="$SYSTEM_SV_DIR/$svc"; fi
+    if [ -e "$target" ]; then
+        [ "$OPT_QUIET" -eq 0 ] && printf "%s\n" "$(_green enabled)"
+        return 0
+    else
+        [ "$OPT_QUIET" -eq 0 ] && printf "%s\n" "$(_red disabled)"
+        return 1
+    fi
+}
+
+_RESOLVED_LOG=""
+_LOG_IS_SOCKLOG=0
+_resolve_log() {
+    svc="$1"
+    svc_path="$(resolve_service "$svc")"
+    svc_name="$(basename "$svc_path")"
+    _RESOLVED_LOG=""
+    _LOG_IS_SOCKLOG=0
+
+    found="$(find_log_file "$svc_name" "$svc_path")"
+    if [ -n "$found" ]; then
+        if [ ! -r "$found" ]; then
+            _err "Log file not readable: $found"
+            _info "Try: sudo lazysvctl log $svc"
+            _info "Or add yourself to the socklog group: sudo usermod -aG socklog \$USER"
+            return 1
+        fi
+        _RESOLVED_LOG="$found"
+        return 0
+    fi
+
+    socklog_everything="/var/log/socklog/everything/current"
+    if [ -f "$socklog_everything" ]; then
+        if [ ! -r "$socklog_everything" ]; then
+            _err "socklog found but not readable: $socklog_everything"
+            _info "Add yourself to the socklog group: sudo usermod -aG socklog \$USER"
+            _info "Then log out and back in, or run: newgrp socklog"
+            return 1
+        fi
+        _RESOLVED_LOG="$socklog_everything"
+        _LOG_IS_SOCKLOG=1
+        return 0
+    fi
+
+    _err "No log found for $svc_name"
+    printf "\n"
+    _info "Tried (per-service svlogd):"
+    _info "  ${svc_path}/log/main/current"
+    _info "  ${svc_path}/log/current"
+    _info "  /var/log/${svc_name}/current"
+    _info "  /var/log/${svc_name}.log"
+    _info "Tried (socklog-void):"
+    _info "  /var/log/socklog/everything/current  — not found"
+    printf "\n"
+    _info "To fix, choose one:"
+    _info "  • Enable socklog: ln -s /etc/sv/socklog-unix /var/service/"
+    _info "                    ln -s /etc/sv/nanoklogd    /var/service/"
+    _info "  • Or add a svlogd log script to ${svc_path}/log/run"
+    return 1
+}
+
+cmd_log_tail() {
+    [ $# -eq 0 ] && { _err "Usage: lazysvctl log-tail SERVICE"; return 1; }
+    svc="$1"
+    _resolve_log "$svc" || return 1
+    if [ "$_LOG_IS_SOCKLOG" -eq 1 ]; then
+        svc_name="$(basename "$(resolve_service "$svc")")"
+        _info "Following socklog (filtered: $svc_name)  (Ctrl+C to stop)"
+        _info "Source: $_RESOLVED_LOG"
+        echo
+        if command -v svlogtail >/dev/null 2>&1; then
+            tail -F "$_RESOLVED_LOG" | grep "$svc_name"
+        else
+            tail -F "$_RESOLVED_LOG" | grep "$svc_name"
+        fi
+    else
+        _info "Following log: $_RESOLVED_LOG  (Ctrl+C to stop)"
+        echo
+        if command -v svlogtail >/dev/null 2>&1; then
+            logdir="$(dirname "$_RESOLVED_LOG")"
+            cd "$logdir" && exec svlogtail
+        else
+            exec tail -F "$_RESOLVED_LOG"
+        fi
+    fi
+}
+
+cmd_log_cat() {
+    [ $# -eq 0 ] && { _err "Usage: lazysvctl log-cat SERVICE"; return 1; }
+    svc="$1"
+    _resolve_log "$svc" || return 1
+    if [ "$_LOG_IS_SOCKLOG" -eq 1 ]; then
+        svc_name="$(basename "$(resolve_service "$svc")")"
+        grep "$svc_name" "$_RESOLVED_LOG"
+    else
+        cat "$_RESOLVED_LOG"
+    fi
+}
+
+
+cmd_user_init() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        target_user="$SUDO_USER"
+    else
+        target_user="$(id -un)"
+    fi
+
+    target_home="$(getent passwd "$target_user" 2>/dev/null | cut -d: -f6)"
+    if [ -z "$target_home" ]; then
+        target_home="/home/$target_user"
+        _warn "Could not look up home dir for $target_user, assuming $target_home"
+    fi
+
+    svc_name="runsvdir-${target_user}"
+    svc_dir="/etc/sv/${svc_name}"
+    svc_run="${svc_dir}/run"
+    svc_link="/var/service/${svc_name}"
+    user_svc_dir="${target_home}/service"
+
+    _section "Setting up per-user runit services for: $target_user"
+
+    if [ "$(id -u)" -ne 0 ]; then
+        _err "This command must be run as root:"
+        _info "  sudo lazysvctl --user init"
+        return 1
+    fi
+
+    if [ -d "$svc_dir" ] && [ -e "$svc_link" ]; then
+        _ok "Already set up: $svc_dir"
+        _ok "Already enabled: $svc_link"
+        _info "User service directory: $user_svc_dir"
+        _info "Control with: lazysvctl --user <command>"
+        return 0
+    fi
+
+    if [ ! -d "$svc_dir" ]; then
+        mkdir -p "$svc_dir"
+        _ok "Created $svc_dir"
+    else
+        _info "Already exists: $svc_dir"
+    fi
+
+    if [ ! -f "$svc_run" ]; then
+        cat > "$svc_run" << RUNEOF
+#!/bin/sh
+export USER="${target_user}"
+export HOME="${target_home}"
+
+groups="\$(id -Gn "${target_user}" | tr ' ' ':')"
+exec chpst -u "${target_user}:\${groups}" runsvdir "${user_svc_dir}"
+RUNEOF
+        chmod +x "$svc_run"
+        _ok "Created $svc_run"
+    else
+        _info "Already exists: $svc_run"
+    fi
+
+    if [ ! -d "$user_svc_dir" ]; then
+        mkdir -p "$user_svc_dir"
+        chown "$target_user" "$user_svc_dir"
+        _ok "Created $user_svc_dir"
+    else
+        _info "Already exists: $user_svc_dir"
+    fi
+
+    if [ ! -e "$svc_link" ]; then
+        ln -s "$svc_dir" "$svc_link"
+        _ok "Enabled: $svc_link → $svc_dir"
+    else
+        _info "Already enabled: $svc_link"
+    fi
+
+    echo
+    _ok "Done. Per-user services are now active for $target_user."
+    _info "Add services to:  $user_svc_dir"
+    _info "Control them with: lazysvctl --user <command>"
+}
+
+main() {
+    [ $# -eq 0 ] && { usage; exit 0; }
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --user)     OPT_USER=1; shift ;;
+            -q|--quiet) OPT_QUIET=1; shift ;;
+            -w)         OPT_TIMEOUT="$2"; shift 2 ;;
+            -w*)        OPT_TIMEOUT="${1#-w}"; shift ;;
+            -h|--help)  usage; exit 0 ;;
+            -v|--version) echo "lazysvctl $VERSION"; exit 0 ;;
+            --)         shift; break ;;
+            -*)         _err "Unknown option: $1"; echo; usage; exit 2 ;;
+            *)          break ;;
+        esac
+    done
+
+    if [ "$OPT_TIMEOUT" -eq "$DEFAULT_TIMEOUT" ] 2>/dev/null && [ -n "${SVWAIT:-}" ]; then
+        OPT_TIMEOUT="$SVWAIT"
+    fi
+
+    COMMAND="${1:-}"; shift || true
+
+    case "$COMMAND" in
+        start)           cmd_sv start          "$@" ;;
+        stop)            cmd_sv stop           "$@" ;;
+        restart)         cmd_sv restart        "$@" ;;
+        reload)          cmd_sv reload         "$@" ;;
+        once)            cmd_sv once           "$@" ;;
+        kill)            cmd_sv kill           "$@" ;;
+        pause)           cmd_sv pause          "$@" ;;
+        cont)            cmd_sv cont           "$@" ;;
+        force-stop)      cmd_sv force-stop     "$@" ;;
+        force-restart)   cmd_sv force-restart  "$@" ;;
+        force-reload)    cmd_sv force-reload   "$@" ;;
+        shutdown|force-shutdown) cmd_sv force-shutdown "$@" ;;
+        try-restart)     cmd_sv try-restart    "$@" ;;
+        status|st)       cmd_status            "$@" ;;
+        is-active)       cmd_is_active         "$@" ;;
+        is-enabled)      cmd_is_enabled        "$@" ;;
+        enable)          cmd_enable            "$@" ;;
+        disable)         cmd_disable           "$@" ;;
+        list|ls)         cmd_list              "$@" ;;
+        log-tail)        cmd_log_tail          "$@" ;;
+        log-cat)         cmd_log_cat           "$@" ;;
+        init)
+            if [ "$OPT_USER" -ne 1 ]; then
+                _err "'init' is only valid with --user"
+                _info "Usage: sudo lazysvctl --user init"
+                exit 2
+            fi
+            cmd_user_init ;;
+        help|-h|--help)  usage; exit 0 ;;
+        "")              usage; exit 0 ;;
+        *)
+            _err "Unknown command: $COMMAND"
+            echo; usage; exit 2
+            ;;
+    esac
+}
+
+main "$@"
